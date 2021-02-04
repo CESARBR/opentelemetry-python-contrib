@@ -60,6 +60,7 @@ from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.rethinkdb.version import __version__
 
 from rethinkdb import r
+from rethinkdb.errors import ReqlCursorEmpty
 
 class MethodExecutionContext:
     def __init__(self, name, trace_provider, *args, **kwargs):
@@ -125,6 +126,18 @@ class RqlQueryTracer:
                 if span.is_recording():
                     span.set_status(Status(StatusCode.ERROR, str(ex)))
                 raise ex
+
+    def _start_new_span(self):
+        if self._running_span is None:
+            name = self._method_context.get_context_path()
+            self._running_span = self._method_context.get_tracer().start_span(name, kind=SpanKind.CLIENT)
+        else:
+            raise Exception("You need to finish the trace before starting a new one")
+    
+    def _stop_running_span(self):
+        self._populate_span(self._running_span)
+        self._running_span.end()
+        self._running_span = None
 
     def _populate_span(
         self,
@@ -196,6 +209,27 @@ class RqlQueryProxy(wrapt.ObjectProxy):
         self.__wrapped__.__exit__(*args, **kwargs)
 
 
+class DefaultCursorProxy(wrapt.ObjectProxy):
+    # pylint: disable=unused-argument
+    def __init__(self, cursor, method_context, *args, **kwargs):
+        wrapt.ObjectProxy.__init__(self, cursor)
+        self._method_context = method_context
+        self.tracer = RqlQueryTracer(self._method_context.add_context("cursor", *args, **kwargs))
+
+    def __iter__(self):
+        self.tracer._start_new_span()
+        return self
+
+    def __next__(self):
+        try:
+            return self.__wrapped__.__next__()
+        except ReqlCursorEmpty as empty:
+            self.tracer._stop_running_span()
+            raise empty
+        except Exception as e:
+            raise e
+
+
 def wrap_table(tracer_provider):
     _tracer_provider = tracer_provider
 
@@ -210,7 +244,20 @@ def wrap_table(tracer_provider):
         method_context = MethodExecutionContext('table', _tracer_provider, *args, **kwargs)
         return RqlQueryProxy(table, method_context, *args, **kwargs)
 
+    def wrap_cursor_(
+        wrapped: typing.Callable[..., typing.Any],
+        instance: typing.Any,
+        args: typing.Tuple[typing.Any, typing.Any],
+        kwargs: typing.Dict[typing.Any, typing.Any],
+    ):
+        """Add object proxy to cursor object."""
+        cursor = wrapped(*args, **kwargs)
+        method_context = MethodExecutionContext('cursor', _tracer_provider, *args, **kwargs)
+        return DefaultCursorProxy(cursor, method_context, *args, **kwargs)
+
+    wrapt.wrap_function_wrapper(r.net, "DefaultCursor", wrap_cursor_)
     wrapt.wrap_function_wrapper(r, "table", wrap_table_)
+
 
 
 class RethinkDBInstrumentor(BaseInstrumentor):
