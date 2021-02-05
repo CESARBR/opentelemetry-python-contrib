@@ -105,6 +105,7 @@ class MethodExecutionContext:
 class RqlQueryTracer:
     def __init__(self, method_context):
         self._method_context = method_context
+        self._running_span = None
 
     def traced_execution(
         self,
@@ -135,6 +136,8 @@ class RqlQueryTracer:
             raise Exception("You need to finish the trace before starting a new one")
     
     def _stop_running_span(self):
+        if self._running_span is None:
+            return
         self._populate_span(self._running_span)
         self._running_span.end()
         self._running_span = None
@@ -209,14 +212,19 @@ class RqlQueryProxy(wrapt.ObjectProxy):
         self.__wrapped__.__exit__(*args, **kwargs)
 
 
+import time
+
+
 class DefaultCursorProxy(wrapt.ObjectProxy):
     # pylint: disable=unused-argument
     def __init__(self, cursor, method_context, *args, **kwargs):
         wrapt.ObjectProxy.__init__(self, cursor)
         self._method_context = method_context
         self.tracer = RqlQueryTracer(self._method_context.add_context("cursor", *args, **kwargs))
+        self.tic = ''
 
     def __iter__(self):
+        self.tic = time.perf_counter()
         self.tracer._start_new_span()
         return self
 
@@ -224,6 +232,9 @@ class DefaultCursorProxy(wrapt.ObjectProxy):
         try:
             return self.__wrapped__.__next__()
         except ReqlCursorEmpty as empty:
+            print("ENDDDDDDDDDDDDDDDDDDDD")
+            toc = time.perf_counter()
+            print(f"Time: {toc - self.tic:0.10f} seconds")
             self.tracer._stop_running_span()
             raise empty
         except Exception as e:
