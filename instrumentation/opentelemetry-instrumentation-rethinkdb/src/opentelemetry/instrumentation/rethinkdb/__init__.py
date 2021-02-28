@@ -50,6 +50,7 @@ API
 ---
 """
 
+import logging
 import wrapt
 import typing
 from opentelemetry import trace as trace_api
@@ -59,8 +60,11 @@ from opentelemetry.trace.status import Status, StatusCode
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.rethinkdb.version import __version__
 
-from rethinkdb import r, net
+from rethinkdb import r
 from rethinkdb.errors import ReqlCursorEmpty
+
+
+logger = logging.getLogger(__name__)
 
 class ConnectionInstanceProxy(wrapt.ObjectProxy):
     # pylint: disable=unused-argument
@@ -75,13 +79,16 @@ class ConnectionInstanceProxy(wrapt.ObjectProxy):
     )
 
     def get_query_str(self, query):
-        result = str(query.serialize(self.__wrapped__._parent._get_json_encoder(query)))
-        ustr = ['\\x00','\\x01','\\x02','\\x03','\\x04','\\x05','\\x06','b\'','\'' ]
-        for u in ustr:
-            result = result.replace(u, '')
+        result = ''
+        try:
+            result = str(query.serialize(self.__wrapped__._parent._get_json_encoder(query)).decode('utf-8','ignore'))
+            result = "{}".format(result.replace(result.partition('[')[0],'',1).strip())
+        except Exception as ex:  # pylint: disable=broad-except
+            result = "Could not get query: {} ".format(ex)
+            logger.debug(result)
         return result
 
-    def traced_execution(
+    def traced_execution_simple(
         self,
         instance,
         run_method,
@@ -90,7 +97,7 @@ class ConnectionInstanceProxy(wrapt.ObjectProxy):
     ):
         name =  'run_query'
         query_str = self.get_query_str(query)
-        if len(query_str) < 4:
+        if self.isContinueQuery(query_str):
             return run_method(query, noreply)
 
         with self.get_tracer().start_as_current_span(
@@ -104,6 +111,58 @@ class ConnectionInstanceProxy(wrapt.ObjectProxy):
                 if span.is_recording():
                     span.set_status(Status(StatusCode.ERROR, str(ex)))
                 raise ex
+
+    def traced_execution(
+        self,
+        instance,
+        run_method,
+        query,
+        noreply
+    ):
+        def run_in_context(span, continue_span):
+            try:
+                result = run_method(query, noreply)
+                if continue_span:
+                    if not span.is_recording():
+                        span.end()
+                return result
+            except Exception as ex:  # pylint: disable=broad-except
+                logger.debug("runquery.traced_execution.exception: {}".format(ex))
+                if span.is_recording():
+                        span.set_status(Status(StatusCode.ERROR, str(ex)))
+                raise ex
+
+        name =  'run_query'
+        query_str = self.get_query_str(query)
+        current_span = trace_api.get_current_span()
+        span = None
+        continue_span = False
+        if self.isContinueQuery(query_str):
+            span = current_span
+            if span and getattr(span, 'name', '') == name:
+                logger.debug("continue span for last query")
+                continue_span = True
+                if span.is_recording():
+                    span.set_attribute(
+                        "db.x.continue", True
+                    )
+                return run_in_context(span, continue_span)
+            else:
+                logger.warning("runquery.traced_execution: current_span name is not run_query: ({})".format(span.name))
+                return run_method(query, noreply)
+        else:
+            logger.debug("starting span for query: {}".format(query_str))
+            if current_span and getattr(current_span, 'name', '') == name:
+                if current_span.is_recording():
+                    current_span.end()
+            with self.get_tracer().start_as_current_span(
+                name, kind=SpanKind.CLIENT
+            ) as span:
+                self._populate_span(span, query_str)
+                return run_in_context(span, continue_span)
+
+    def isContinueQuery(self, query):
+        return query == "[2]"
 
     def _populate_span(
         self,
@@ -122,7 +181,6 @@ class ConnectionInstanceProxy(wrapt.ObjectProxy):
     def run_query(self, query, noreply):
         return self.traced_execution(self.__wrapped__, self.__wrapped__.run_query, query, noreply)
 
-
 class ConnectionProxy(wrapt.ObjectProxy):
     # pylint: disable=unused-argument
     def __init__(self, connection, tracer_provider, *args, **kwargs):
@@ -130,10 +188,10 @@ class ConnectionProxy(wrapt.ObjectProxy):
         self._tracer_provider = tracer_provider
         connection._instance = ConnectionInstanceProxy(connection._instance, tracer_provider, *args, **kwargs)
 
-    def reconnect(self, noreply_wait, timeout):
-        conn = self.__wrapped__.reconnect(noreply_wait, timeout)
+    def reconnect(self, *args, **kwargs):
+        conn = self.__wrapped__.reconnect(*args, **kwargs)
         if not isinstance(conn, wrapt.ObjectProxy):
-            conn = ConnectionProxy(conn, self.tracer_provider)
+            conn = ConnectionProxy(conn, self.tracer_provider, *args, **kwargs)
         return conn
 
 
@@ -151,7 +209,6 @@ def wrap_connection(tracer_provider):
         return ConnectionProxy(conn, tracer_provider, *args, **kwargs)
 
     wrapt.wrap_function_wrapper(r, "connect", wrap_connect_)
-
 class RethinkDBInstrumentor(BaseInstrumentor):
     def _instrument(self, **kwargs):
         """Integrate with RethinkDB Python library.
@@ -163,4 +220,4 @@ class RethinkDBInstrumentor(BaseInstrumentor):
 
     def _uninstrument(self, **kwargs):
         """"Disable RethinkDB instrumentation"""
-        unwrap(r, "table")
+        unwrap(r, "connect")
