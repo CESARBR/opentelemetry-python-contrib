@@ -53,6 +53,9 @@ API
 import logging
 import wrapt
 import typing
+import re
+from functools import reduce
+
 from opentelemetry import trace as trace_api
 from opentelemetry.instrumentation.utils import unwrap
 from opentelemetry.trace import SpanKind, get_tracer
@@ -62,6 +65,7 @@ from opentelemetry.instrumentation.rethinkdb.version import __version__
 
 from rethinkdb import r
 from rethinkdb.errors import ReqlCursorEmpty
+from .rethinkdb_meta import RETHINK_COMMANDS, RETHINK_QUERY_TYPE
 
 
 logger = logging.getLogger(__name__)
@@ -88,6 +92,23 @@ class ConnectionInstanceProxy(wrapt.ObjectProxy):
             logger.debug(result)
         return result
 
+    def parse_query(self, query):
+        result = None
+        try:
+            query_type = None
+            commands = list(filter(lambda x: x is not None,
+                        list(map((lambda x: int(x) if x.isnumeric() else None) ,
+                        re.findall(r'\[(\d*),',query))))) if len(query) > 3 else [int(query.replace('[','').replace(']','')), 14]
+
+            query_type = RETHINK_QUERY_TYPE[commands[0]] if commands[0] in range(1, 5) else 'undefined'
+
+            path = reduce((lambda x, y: "{x}/{y}".format(x=RETHINK_COMMANDS[x] if type(x) == int else x, y=RETHINK_COMMANDS[y])),
+                        commands[1: ],'') if len(commands) > 2 else "/{}".format(RETHINK_COMMANDS[commands[1]])
+            result = query_type, "rethinkdb:{}".format(path)
+        except Exception as ex:
+            result = query_type, "Could not parse query: {query}. Error={error} ".format(query=query, error=ex)
+        return result
+
     def traced_execution_simple(
         self,
         instance,
@@ -95,9 +116,11 @@ class ConnectionInstanceProxy(wrapt.ObjectProxy):
         query,
         noreply
     ):
-        name =  'run_query'
         query_str = self.get_query_str(query)
-        if self.isContinueQuery(query_str):
+        query_type, query_path = self.parse_query(query_str)
+        name = query_path
+
+        if self.isContinueQuery(query_type):
             return run_method(query, noreply)
 
         with self.get_tracer().start_as_current_span(
@@ -132,14 +155,15 @@ class ConnectionInstanceProxy(wrapt.ObjectProxy):
                         span.set_status(Status(StatusCode.ERROR, str(ex)))
                 raise ex
 
-        name =  'run_query'
         query_str = self.get_query_str(query)
+        query_type, query_path = self.parse_query(query_str)
+        name = query_path
         current_span = trace_api.get_current_span()
         span = None
         continue_span = False
-        if self.isContinueQuery(query_str):
+        if self.isContinueQuery(query_type):
             span = current_span
-            if span and getattr(span, 'name', '') == name:
+            if span and getattr(span, 'name', '').startswith("rethinkdb"):
                 logger.debug("continue span for last query")
                 continue_span = True
                 if span.is_recording():
@@ -148,11 +172,11 @@ class ConnectionInstanceProxy(wrapt.ObjectProxy):
                     )
                 return run_in_context(span, continue_span)
             else:
-                logger.warning("runquery.traced_execution: current_span name is not run_query: ({})".format(span.name))
+                logger.warning("runquery.traced_execution: current_span name is not rethinkdb query: ({})".format(span.name))
                 return run_method(query, noreply)
         else:
             logger.debug("starting span for query: {}".format(query_str))
-            if current_span and getattr(current_span, 'name', '') == name:
+            if current_span and getattr(current_span, 'name', '').startswith("rethinkdb"):
                 if current_span.is_recording():
                     current_span.end()
             with self.get_tracer().start_as_current_span(
@@ -161,8 +185,8 @@ class ConnectionInstanceProxy(wrapt.ObjectProxy):
                 self._populate_span(span, query_str)
                 return run_in_context(span, continue_span)
 
-    def isContinueQuery(self, query):
-        return query == "[2]"
+    def isContinueQuery(self, query_type):
+        return query_type == "continue"
 
     def _populate_span(
         self,
@@ -209,6 +233,7 @@ def wrap_connection(tracer_provider):
         return ConnectionProxy(conn, tracer_provider, *args, **kwargs)
 
     wrapt.wrap_function_wrapper(r, "connect", wrap_connect_)
+
 class RethinkDBInstrumentor(BaseInstrumentor):
     def _instrument(self, **kwargs):
         """Integrate with RethinkDB Python library.
